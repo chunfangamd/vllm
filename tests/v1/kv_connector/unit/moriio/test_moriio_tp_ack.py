@@ -3,6 +3,9 @@
 
 import threading
 from collections import defaultdict
+from collections.abc import Callable
+from contextvars import ContextVar
+from itertools import count
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -25,6 +28,29 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
+
+from .test_moriio_read_lifetime import _native_worker
+from .test_moriio_read_lifetime import transport as _native_transport  # noqa: F401
+
+_worker_factory: ContextVar[Callable[[], MoRIIOConnectorWorker]] = ContextVar(
+    "moriio_ack_worker_factory"
+)
+
+
+@pytest.fixture(autouse=True)
+def _constructed_workers(tmp_path, request):
+    bus = request.getfixturevalue("_native_transport")
+    serial = count()
+
+    def construct():
+        directory = tmp_path / str(next(serial))
+        directory.mkdir()
+        worker, _ = _native_worker(directory, bus)
+        return worker
+
+    token = _worker_factory.set(construct)
+    yield
+    _worker_factory.reset(token)
 
 
 def test_remote_tp_rank_same_tp_maps_to_self():
@@ -254,7 +280,7 @@ def test_worker_get_finished_counts_structured_release_fan_in():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.is_producer = True
     worker.mode = MoRIIOMode.READ
     worker.world_size = 4
@@ -278,7 +304,7 @@ def test_worker_reports_unexpected_heartbeat_exit(exit_kind):
         MoRIIOHeartbeat,
     )
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.is_producer = True
     worker.mode = MoRIIOMode.READ
     worker.moriio_wrapper = SimpleNamespace(
@@ -331,7 +357,7 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
             pass
 
     wrapper = FakeWrapper()
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.world_size = 8
     worker.moriio_config = SimpleNamespace(recv_abort_timeout=600.0)
     worker.moriio_wrapper = wrapper
@@ -381,7 +407,7 @@ def test_aborted_read_without_local_blocks_only_releases_remote_blocks():
             pass
 
     wrapper = FakeWrapper()
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.mode = MoRIIOMode.READ
     worker.world_size = 8
     worker.moriio_wrapper = wrapper
@@ -435,7 +461,7 @@ def test_read_completion_waits_for_every_posted_read():
             pass
 
     wrapper = FakeWrapper()
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.world_size = 8
     worker.moriio_config = SimpleNamespace(recv_abort_timeout=600.0)
     worker.moriio_wrapper = wrapper
@@ -459,7 +485,7 @@ def test_read_completion_waits_for_every_posted_read():
     [(False, {1, 2}), (True, set())],
 )
 def test_failed_read_reports_blocks_only_without_hma(has_mamba, expected_invalid):
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = has_mamba
     worker._recving_local_blocks = {"req": [1, 2]}
     worker._invalid_block_ids = set()
@@ -477,7 +503,7 @@ def test_hybrid_step_barrier_fails_closed():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = True
     worker._reads_issued_this_step = [_ReadStatus("failed")]
     worker.moriio_wrapper = FailingWrapper()
@@ -498,7 +524,7 @@ def test_step_barrier_awaits_every_read_before_forward():
             pass
 
     attn, indexer, mtp_attn = object(), object(), object()
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = False
     worker._reads_issued_this_step = [attn, indexer, mtp_attn]
     worker.moriio_wrapper = RecordingWrapper()
@@ -530,7 +556,7 @@ def test_step_barrier_without_mamba_does_not_raise_on_failure():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = False
     worker._reads_issued_this_step = [_ReadStatus("failed")]
     worker.moriio_wrapper = FailingWrapper()
@@ -593,7 +619,7 @@ def fake_clock(monkeypatch):
 
 def _worker_with_failed_and_pending_read(has_mamba, pending_b, monkeypatch):
     failed_a = _ReadStatus("failed")
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = has_mamba
     worker.world_size = 1
     worker.moriio_config = SimpleNamespace(recv_abort_timeout=600.0)
@@ -640,7 +666,7 @@ def test_hybrid_step_barrier_failure_does_not_wait(monkeypatch, fake_clock):
 
 @pytest.mark.parametrize("has_mamba", [False, True])
 def test_step_barrier_timeout_fails_closed_while_reads_in_flight(has_mamba, fake_clock):
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = has_mamba
     worker.moriio_wrapper = MoRIIOWrapper(moriio_engine=object(), transfer_timeout=0.05)
     worker._reads_issued_this_step = [_PolledStatus(), _PolledStatus()]
@@ -663,7 +689,7 @@ def test_step_barrier_native_timeout_fails_closed_while_reads_in_flight(
         return moriio_engine.StatusCode.IN_PROGRESS
 
     engine = SimpleNamespace(wait_all=Mock(side_effect=wait_all))
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = has_mamba
     worker.moriio_wrapper = MoRIIOWrapper(moriio_engine=engine, transfer_timeout=0.05)
     worker._reads_issued_this_step = [_PolledStatus(), _PolledStatus()]
@@ -686,7 +712,7 @@ def test_step_barrier_noop_when_no_reads_posted():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker._has_mamba = False
     worker._reads_issued_this_step = []
     worker.moriio_wrapper = RecordingWrapper()
@@ -707,7 +733,7 @@ def test_write_mode_read_blocks_posts_no_read():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.mode = MoRIIOMode.WRITE
     worker._reads_issued_this_step = []
     worker.moriio_wrapper = RecordingWrapper()
@@ -742,7 +768,7 @@ def test_producer_start_load_kv_posts_no_read():
         def shutdown(self):
             pass
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker = _worker_factory.get()()
     worker.is_producer = True
     worker._reads_issued_this_step = []
     worker._consumer_notification_counts = {}

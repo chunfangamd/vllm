@@ -162,6 +162,27 @@ The number of KV heads must be a multiple or a divisor of each TP size. Blocks a
 !!! note
     On a single node with the xGMI backend, MoRI cannot open a session to memory on a peer's second or later GPU from a rank that sees fewer GPUs, and the transfer fails with an error naming the peer. In WRITE mode this rules out a larger decode TP size. In READ mode it rules out a larger prefill TP size, except for MLA models without recurrent state, which read every replicated latent from the first prefill rank. The other directions work on xGMI, and the RDMA backend is not affected.
 
+### ACK-fenced ownership for sliced READ
+
+Head-sliced heterogeneous-TP READ and heterogeneous Mamba/KDA READ require
+`"read_ack_fenced_hold": true` in every producer rank's
+`kv_connector_extra_config`, together with `"read_mode": true` and
+`"kv_role": "kv_producer"`. The setting is a strict JSON boolean, defaults to
+`false`, and does not advertise a capability in WRITE mode or on a consumer.
+Peers without the capability are rejected before any sliced READ is posted.
+Equal-TP and whole-copy MLA/replicated-head READ retain their existing behavior.
+
+The producer scheduler with this opt-in retains source blocks until all required
+consumer ACKs arrive; `defer_timeout` cannot free them first. An early terminal
+ACK is retained until request completion. The consumer validates all peer/layer
+plans before posting and keeps each returned native status immediately. It
+releases producers only after all posts are sealed and all statuses are terminal.
+A partial posting exception or a still-pending transfer fails the forward and
+retains ownership across steps. A Python deadline cannot cancel native I/O or
+prove that its destination blocks are reusable. Missing ACKs or unknown native
+posting state require engine containment; this path provides no cancellation or
+automatic reclamation guarantee.
+
 ### Pipeline-parallel prefill
 
 In WRITE mode the prefill instance can run with `--pipeline-parallel-size` greater than 1, for example `--tensor-parallel-size 1 --pipeline-parallel-size 4` against a decode instance with `--tensor-parallel-size 4`. Each pipeline stage writes the layers it holds into the decode blocks, and a decode rank starts decoding only after every stage has reported its writes. The block allocations from the decode instance is sent to the first pipeline stage, which then forwards them to the other stages.

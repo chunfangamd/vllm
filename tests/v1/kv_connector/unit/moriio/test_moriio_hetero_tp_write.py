@@ -10,9 +10,11 @@ and recurrent-state slot, nothing else is touched, every prefill rank frees
 its blocks, and a decode rank completes only after all its writers did.
 """
 
-import threading
-from collections import OrderedDict
-from dataclasses import dataclass, field
+import mmap
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from itertools import count
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +22,7 @@ import msgspec
 import pytest
 import torch
 
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import ssm_conv_transfer_utils
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio import moriio_engine
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
@@ -41,20 +44,22 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_tp_mapping import (
     _rank_heads,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
-    derive_mamba_conv_split,
-)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
     compute_layout_strides,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from ..utils import make_moriio_writer
+from .test_moriio_read_lifetime import _configuration
+from .test_moriio_read_lifetime import transport as _transport_service  # noqa: F401
 
 pytestmark = pytest.mark.cpu_test
 
@@ -101,20 +106,6 @@ MODELS = {
 
 def _layer_heads(layer: Layer, heads: int) -> int:
     return heads if layer.heads is None else layer.heads
-
-
-class _ArchConfig:
-    """Per-layer KV-head counts, as ModelArchitectureConfig exposes them."""
-
-    def __init__(self, layers: list[Layer], heads: int):
-        counts = [_layer_heads(layer, heads) for layer in layers]
-        self.per_layer_overrides = (
-            None if len(set(counts)) == 1 else [{} for _ in layers]
-        )
-        self._counts = counts
-
-    def __getitem__(self, layer_idx: int) -> SimpleNamespace:
-        return SimpleNamespace(total_num_kv_heads=self._counts[layer_idx])
 
 
 def _groups(model: str, hma: bool) -> list[str]:
@@ -202,6 +193,87 @@ class Rank:
     sent: list = field(default_factory=list)
 
 
+_rank_worker_factory: ContextVar[Callable[..., MoRIIOConnectorWorker]] = ContextVar(
+    "moriio_rank_worker_factory"
+)
+
+
+@pytest.fixture(autouse=True)
+def _real_rank_workers(tmp_path, request, monkeypatch):
+    """Initialize protocol state through real constructors/registration.
+
+    Existing matrix tests retain their original byte-copy/fault transports.
+    New lifecycle tests exercise the real wrapper and handshake as well.
+    """
+    bus = request.getfixturevalue("_transport_service")
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    serial = count()
+
+    def construct(heads, layers, groups, specs, caches, tp_rank, tp_size, producer):
+        bus.rank, bus.tp = tp_rank, tp_size
+        directory = tmp_path / str(next(serial))
+        directory.mkdir()
+        config = _configuration(
+            directory, role="kv_producer" if producer else "kv_consumer"
+        )
+        # Explicit architecture metadata for the pre-existing synthetic cache
+        # matrix. These are real config objects, never a replacement worker or
+        # private protocol state; no model is instantiated or inferred here.
+        overrides = [
+            {"total_num_kv_heads": _layer_heads(layer, heads)} for layer in layers
+        ]
+        config.model_config.model_arch_config = replace(
+            config.model_config.model_arch_config,
+            total_num_hidden_layers=len(layers),
+            total_num_kv_heads=heads,
+            is_deepseek_mla=layers[0].kind == "mla",
+            per_layer_overrides=overrides
+            if any(layer.heads is not None for layer in layers)
+            else None,
+        )
+        config.cache_config.block_size = BLOCK_SIZE
+        config = VllmConfig(
+            model_config=config.model_config,
+            cache_config=config.cache_config,
+            scheduler_config=config.scheduler_config,
+            device_config=config.device_config,
+            kv_transfer_config=config.kv_transfer_config,
+            parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
+        )
+        cache_groups = []
+        for group in groups:
+            names = [
+                layer.name
+                for layer in layers
+                if (layer.group if len(groups) > 1 else "full") == group
+            ]
+            selected = {name: specs[name] for name in names}
+            spec = (
+                next(iter(selected.values()))
+                if len(selected) == 1
+                else UniformTypeKVCacheSpecs(
+                    block_size=BLOCK_SIZE,
+                    kv_cache_specs=selected,
+                )
+            )
+            cache_groups.append(KVCacheGroupSpec(names, spec))
+        worker = MoRIIOConnectorWorker(
+            config,
+            f"matrix-{next(serial)}",
+            KVCacheConfig(
+                num_blocks=NUM_BLOCKS, kv_cache_tensors=[], kv_cache_groups=cache_groups
+            ),
+        )
+        bus.track(worker)
+        worker.register_kv_caches(caches)
+        worker._moriio_handshake_listener_t.join(2)
+        return worker
+
+    token = _rank_worker_factory.set(construct)
+    yield
+    _rank_worker_factory.reset(token)
+
+
 def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Rank:
     heads, layers = MODELS[model]
     groups = _groups(model, hma)
@@ -210,7 +282,10 @@ def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Ran
         layer_heads = len(_rank_heads(tp_rank, tp_size, _layer_heads(layer, heads)))
         spec = _spec(layer, layer_heads, tp_size)
         specs[layer.name] = spec
-        buffer = torch.zeros(spec.page_size_bytes * NUM_BLOCKS, dtype=torch.uint8)
+        nbytes = spec.page_size_bytes * NUM_BLOCKS
+        backing = mmap.mmap(-1, ((nbytes + 4095) // 4096) * 4096)
+        buffer = torch.frombuffer(backing, dtype=torch.uint8)[:nbytes]
+        buffer.zero_()
         if layer.kind == "mamba":
             cache = buffer.view(NUM_BLOCKS, 1, 1, spec.page_size_bytes)
             conv, ssm = kda_conv_ssm(cache, spec)
@@ -244,42 +319,9 @@ def _build_rank(model, tp_rank, tp_size, layout, hma, state, is_producer) -> Ran
             meta_counts[layer.name] = 1
         caches[layer.name] = cache
 
-    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
-    worker.tp_rank = tp_rank
-    worker.pp_rank, worker.pp_size = 0, 1
-    worker.world_size = tp_size
-    worker.use_mla = layers[0].kind == "mla"
-    worker._has_mamba = any(layer.kind == "mamba" for layer in layers)
-    worker.model_config = SimpleNamespace(
-        get_total_num_kv_heads=lambda: heads,
-        model_arch_config=_ArchConfig(layers, heads),
+    worker = _rank_worker_factory.get()(
+        heads, layers, groups, specs, caches, tp_rank, tp_size, is_producer
     )
-    worker.kv_caches = caches
-    worker.num_blocks = NUM_BLOCKS
-    worker.layer_to_spec = specs
-    worker.layer_to_group = {
-        layer.name: groups.index(layer.group if hma else "full") for layer in layers
-    }
-    worker._hybrid_payload_index_by_layer = {
-        layer.name: groups.index("mamba") for layer in layers if layer.kind == "mamba"
-    }
-    worker._conv_decomp = next(
-        (
-            derive_mamba_conv_split(spec, tp_size)
-            for spec in specs.values()
-            if isinstance(spec, MambaSpec)
-        ),
-        None,
-    )
-    worker.kv_layer_mr_offset = {}
-    worker._mamba_offset_templates = {}
-    worker._region_session_index = None
-    worker.layer_name_to_local_kv_cache_metadata = {
-        layer.name: [b""] * meta_counts[layer.name] for layer in layers
-    }
-    worker._record_slice_layouts(caches)
-    # Built without __init__: there is no engine to shut down.
-    worker.shutdown = lambda: None
     return Rank(tp_rank, tp_size, caches, regions, worker)
 
 
@@ -294,7 +336,8 @@ def _connect(producer: Rank, consumers: list[Rank], dp_engine: str) -> None:
     metadata = MoRIIOAgentMetadata(
         engine_id="decode",
         agent_metadata=b"",
-        kv_caches_base_addr=[],
+        kv_caches_base_addr=consumer.kv_caches_base_addr[consumer.engine_id],
+        layer_base_addr_index=consumer.layer_base_addr_index,
         num_blocks=NUM_BLOCKS,
         block_len=0,
         attn_backend_name="test",
@@ -337,27 +380,15 @@ def _connect(producer: Rank, consumers: list[Rank], dp_engine: str) -> None:
         )
 
     producer.worker._get_built_session = get_built_session
-    producer.wrapper = SimpleNamespace(
-        done_remote_allocate_req_dict={},
-        lock=threading.Lock(),
-        done_req_ids=[],
-        write_remote_data=write_remote_data,
-        send_notify=send_notify,
-        waiting_for_transfer_complete=lambda statuses: None,
-        _mark_transfer_terminal_locked=lambda transfer_id: None,
-        _is_transfer_terminal_locked=lambda transfer_id: False,
-    )
+    producer.wrapper = MoRIIOWrapper()
+    producer.wrapper.write_remote_data = write_remote_data
+    producer.wrapper.send_notify = send_notify
+    producer.wrapper.waiting_for_transfer_complete = lambda statuses: None
     producer.worker.moriio_wrapper = producer.wrapper
 
 
 def _consumer_wrapper() -> MoRIIOWrapper:
-    wrapper = MoRIIOWrapper.__new__(MoRIIOWrapper)
-    wrapper.lock = threading.Lock()
-    wrapper.done_write_cache_req_ids = []
-    wrapper.failed_write_cache_req_ids = []
-    wrapper._write_done_senders = {}
-    wrapper._terminal_transfer_ids = OrderedDict()
-    return wrapper
+    return MoRIIOWrapper()
 
 
 def _expected(

@@ -50,6 +50,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     WriteTask,
     fold_local_rank,
     get_moriio_mode,
+    get_moriio_read_ack_fenced_hold,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
@@ -785,6 +786,9 @@ class MoRIIOConnectorScheduler:
         # only the worker can mark the transfer terminal before blocks are freed.
         # Value: (deadline, transfer_id) for unmapping after completion.
         self._deferred_send_deadlines: dict[ReqId, tuple[float, TransferId | None]] = {}
+        self._read_ack_fenced_hold = get_moriio_read_ack_fenced_hold(
+            self.kv_transfer_config
+        )
         self._defer_timeout = float(
             self.kv_transfer_config.kv_connector_extra_config.get(
                 "defer_timeout", MoRIIOConstants.DEFAULT_DEFER_TIMEOUT
@@ -1741,12 +1745,12 @@ class MoRIIOConnectorScheduler:
         * An ACK that arrives BEFORE its request finished is parked in
           `_pending_sent_acks` and released on a later step once the
           request enters `_deferred_send_deadlines`.
-        * In READ mode, a deferred send whose ACK never arrives is reaped
-          after `_defer_timeout`. WRITE-mode timeouts are owned by the worker,
+        * Legacy READ sends are reaped after `_defer_timeout`. Opted-in
+          ACK-fenced READ producers retain their blocks until a terminal ACK;
+          elapsed time is not native cancellation. WRITE timeouts belong to the worker,
           which marks the transfer terminal before ACKing the block release.
-        * A parked ACK that never matches a deferral before its own
-          deadline is a stale duplicate (e.g. a real ACK landing after the
-          send was already reaped) and is dropped.
+        * Legacy parked ACKs expire; ACK-fenced producers retain an early ACK
+          until its request enters the delayed-free lifecycle.
 
         Consumers never populate finished_sending (they report
         finished_recving), and they unmap in request_finished, so this is a
@@ -1776,7 +1780,9 @@ class MoRIIOConnectorScheduler:
         expired = [
             req_id
             for req_id, (deadline, _) in self._deferred_send_deadlines.items()
-            if self.mode == MoRIIOMode.READ and now >= deadline
+            if self.mode == MoRIIOMode.READ
+            and now >= deadline
+            and not self._read_ack_fenced_hold
         ]
         if expired:
             safe.update(expired)
@@ -1800,7 +1806,7 @@ class MoRIIOConnectorScheduler:
         stale = [
             req_id
             for req_id, deadline in self._pending_sent_acks.items()
-            if now >= deadline
+            if now >= deadline and not self._read_ack_fenced_hold
         ]
         for req_id in stale:
             self._pending_sent_acks.pop(req_id, None)
@@ -2033,6 +2039,8 @@ class MoRIIOConnectorWorker:
         self._invalid_block_ids: set[int] = set()
         # This step's posted reads, awaited in start_load_kv before the forward.
         self._reads_issued_this_step: list = []
+        self._sharded_read_requests: set[str] = set()
+        self._uncertain_read_posts: set[str] = set()
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -2558,10 +2566,10 @@ class MoRIIOConnectorWorker:
         slack = ptr % page_size
         end = 0
         for layer_name in kv_caches:
-            _, region_len = next(
-                iter(self._iter_layer_registration_regions(layer_name))
-            )
-            end = max(end, kv_caches[layer_name].data_ptr() - ptr + region_len)
+            # A legacy 5D cache registers K and V as distinct regions. The
+            # shared MR must span both, not just the first region's end.
+            for region, region_len in self._iter_layer_registration_regions(layer_name):
+                end = max(end, region.data_ptr() - ptr + region_len)
         reg_nbytes = ((slack + end + page_size - 1) // page_size) * page_size
         if reg_nbytes > nbytes:
             raise ValueError(
@@ -2891,6 +2899,7 @@ class MoRIIOConnectorWorker:
             },
             attention_block_sizes=self.attention_block_sizes,
             layer_base_addr_index=self.layer_base_addr_index,
+            read_ack_fenced_hold=self.moriio_config.read_ack_fenced_hold,
         )
         ready_event = threading.Event()
         self._moriio_handshake_listener_t = threading.Thread(
@@ -3054,6 +3063,15 @@ class MoRIIOConnectorWorker:
                     for status in layer_statuses
                 ]
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
+                if req_id in self._sharded_read_requests and (
+                    req_id in self._uncertain_read_posts
+                    or any(
+                        not (status.Succeeded() or status.Failed())
+                        for status in statuses
+                    )
+                ):
+                    # An expired Python deadline is not native cancellation.
+                    continue
                 if statuses and state is TransferBatchState.DONE:
                     host, ports, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
@@ -3105,6 +3123,7 @@ class MoRIIOConnectorWorker:
                 del self._recving_transfers_callback_addr[req_id]
                 self._recving_transfers_start.pop(req_id, None)
                 self._recving_local_blocks.pop(req_id, None)
+                self._sharded_read_requests.discard(req_id)
 
             return done_req_ids
 
@@ -3122,8 +3141,16 @@ class MoRIIOConnectorWorker:
         re-raised because the scheduler's recovery path does not support
         multiple cache groups.
         """
+        if self._uncertain_read_posts:
+            raise TransferError("Sharded READ posting failed with unknown native state")
         statuses = self._reads_issued_this_step
         self._reads_issued_this_step = []
+        # A prior failed wait does not make outstanding sharded reads safe.
+        for req_id in self._sharded_read_requests:
+            for batch in self._recving_transfers.get(req_id, {}).values():
+                for status in batch:
+                    if not any(status is seen for seen in statuses):
+                        statuses.append(status)
         if not statuses:
             return
         try:
@@ -3610,10 +3637,10 @@ class MoRIIOConnectorWorker:
     ) -> tuple[list[tuple[int, ReadSource | None]], tuple[int, ...]]:
         """(sources, holders) of one request's READ.
 
-        ``sources`` pairs each prefill TP rank to read with what to take from it
-        (None: the whole shard, equal TP). ``holders`` are the prefill TP ranks
+        `sources` pairs each prefill TP rank to read with what to take from it
+        (None: the whole shard, equal TP). `holders` are the prefill TP ranks
         to release, which in fan-in include ranks whose identical copy is not
-        read. ``chosen_tp`` replaces the source when every holder has the same
+        read. `chosen_tp` replaces the source when every holder has the same
         copy (the flexible mirror's round-robin pick). Sources depend on the
         layer's KV-head count; holders do not.
         """
@@ -3637,6 +3664,18 @@ class MoRIIOConnectorWorker:
             sources = [(int(chosen_tp), ReadSource(int(chosen_tp), only.target))]
         return sources, mapping.holder_tp_ranks
 
+    def _read_needs_ack_fence(self, remote_tp_size: int) -> bool:
+        """New sliced READs need producer ownership beyond a time-only watchdog."""
+        if remote_tp_size == self.world_size:
+            return False
+        if self._has_mamba:
+            return True
+        return any(
+            self._read_tp_mapping(remote_tp_size, layer).local_num_heads
+            != self._read_tp_mapping(remote_tp_size, layer).remote_num_heads
+            for layer in self.kv_caches
+        )
+
     def _read_handshake_tp_ranks(self, remote_tp_size: int) -> tuple[int, ...]:
         """Prefill TP ranks a heterogeneous-TP READ opens sessions to: the
         sources of every layer."""
@@ -3645,6 +3684,8 @@ class MoRIIOConnectorWorker:
             if not self._is_mamba_layer(layer_name):
                 mapping = self._read_tp_mapping(remote_tp_size, layer_name)
                 ranks.update(mapping.source_tp_ranks)
+        if self._read_needs_ack_fence(remote_tp_size):
+            ranks.update(self._read_tp_mapping(remote_tp_size).holder_tp_ranks)
         return tuple(sorted(ranks))
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
@@ -3856,7 +3897,7 @@ class MoRIIOConnectorWorker:
         target: WriteTarget,
         remote_engine_id: EngineId | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
-        """Offsets writing ``target``'s KV heads of a block into the peer."""
+        """Offsets writing `target`'s KV heads of a block into the peer."""
         remote_wire = remote_moriio_meta.kv_head_layouts.get(layer_name)
         local_layout = self.kv_head_layouts.get(layer_name)
         if remote_wire is None or local_layout is None:
@@ -3889,7 +3930,7 @@ class MoRIIOConnectorWorker:
         remote_moriio_meta: MoRIIOAgentMetadata,
         target: WriteTarget,
     ) -> tuple[list[int], list[int], list[int], int]:
-        """(local, remote, sizes, n_conv) writing ``target``'s state slice."""
+        """(local, remote, sizes, n_conv) writing `target`'s state slice."""
         remote_wire = remote_moriio_meta.mamba_state_layouts.get(layer_name)
         if remote_wire is None:
             raise MoRIIOError(
@@ -3917,9 +3958,9 @@ class MoRIIOConnectorWorker:
         remote_engine_id: EngineId,
         source: ReadSource | None,
     ) -> tuple[list[int], list[int], list[int]]:
-        """(local, remote, sizes) pulling ``source``'s share of a layer.
+        """(local, remote, sizes) pulling `source`'s share of a layer.
 
-        The prefill rank is the side whose heads ``source.target`` names as
+        The prefill rank is the side whose heads `source.target` names as
         local, so the head-slice offsets are computed from it and swapped.
         """
         same_layout = self._block_copy_matches_peer(layer_name, remote_moriio_meta)
@@ -4010,7 +4051,7 @@ class MoRIIOConnectorWorker:
         remote_moriio_meta: MoRIIOAgentMetadata,
         source: ReadSource,
     ) -> tuple[list[int], list[int], list[int], int]:
-        """(local, remote, sizes, n_conv) pulling ``source``'s state slice."""
+        """(local, remote, sizes, n_conv) pulling `source`'s state slice."""
         remote_wire = remote_moriio_meta.mamba_state_layouts.get(layer_name)
         if remote_wire is None:
             raise MoRIIOError(
@@ -4122,7 +4163,7 @@ class MoRIIOConnectorWorker:
         The layer owns two registered regions, so the offset list is split at
         the conv/ssm boundary and each half goes to its own session. A half
         with nothing to move is skipped rather than posted empty. With a
-        ``source`` (heterogeneous TP) only its slice of the state is read.
+        `source` (heterogeneous TP) only its slice of the state is read.
         """
         if source is None:
             local, remote, sizes, n_conv = self._compute_mamba_transfer_offsets(
@@ -4251,6 +4292,8 @@ class MoRIIOConnectorWorker:
             )
             for tp_rank in holders
         )
+        if request_id in self._recving_transfers:
+            raise MoRIIOError("READ request still owns an active transfer")
         if not any(local_block_ids):
             # A request aborted before decode allocation still carries the
             # producer's block table. There is no local destination or forward,
@@ -4294,27 +4337,31 @@ class MoRIIOConnectorWorker:
                     built[tp_rank] = (*self._get_built_session(engine_id), engine_id)
                 yield (source, *built[tp_rank])
 
-        # SQ-full backpressure deadline, shared across this request's layers.
-        _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        # TODO: apply multi-session batch-read when MoRIIO supports it.
+        fenced = self._read_needs_ack_fence(remote_tp_size)
+        if fenced:
+            # Validate *every* holder before a post, including replicated ranks
+            # whose identical bytes are not read but whose allocation is held.
+            for _ in reads([(rank, None) for rank in holders]):
+                pass
+            for _, metadata, _ in built.values():
+                if metadata.read_ack_fenced_hold is not True:
+                    raise MoRIIOError(
+                        "Sliced READ requires ACK-fenced producer block hold"
+                    )
+
+        # Plan all layers and peers before native I/O. A bad later peer, cache
+        # group, session or offset must not leave an earlier RDMA write live.
+        plans = []
         for layer_name in self.layer_name_to_local_kv_cache_metadata:
             region_sessions = self._region_session_indices(layer_name)
-            statuses = []
             if self._is_mamba_layer(layer_name):
                 local_mamba = self._mamba_blocks_for_layer(layer_name, local_block_ids)
                 remote_mamba = self._mamba_blocks_for_layer(
                     layer_name, remote_block_ids
                 )
-                # KDA layer: pull conv (sub-projection offsets) and ssm at the
-                # request's recurrent-state slot. Two regions -> two sessions.
                 if not local_mamba or not remote_mamba:
                     if not local_attn and not remote_attn:
-                        # Whole-request no-op (e.g. full prefix cache hit):
-                        # nothing to transfer for any layer.
                         continue
-                    # A KDA layer must have its recurrent-state slot in the
-                    # block-id tuple; missing it (while attention blocks are
-                    # present) means the mamba KV-cache group is absent -> bug.
                     raise MoRIIOError(
                         f"KDA layer {layer_name}: missing mamba recurrent-state "
                         f"block ids (local={local_mamba}, remote={remote_mamba}) "
@@ -4322,21 +4369,36 @@ class MoRIIOConnectorWorker:
                         "the mamba KV-cache group is absent from the transfer "
                         "block-id tuple"
                     )
-                for source, sessions, remote_moriio_meta, _ in reads(sources):
-                    statuses.extend(
-                        self._post_mamba_reads(
-                            layer_name,
-                            sessions,
-                            region_sessions,
-                            local_mamba,
-                            remote_mamba,
-                            remote_tp_size,
-                            request_id,
-                            _sq_deadline,
-                            remote_moriio_meta=remote_moriio_meta,
-                            source=source,
+                for source, sessions, metadata, _ in reads(sources):
+                    if source is None:
+                        local, remote, sizes, n_conv = (
+                            self._compute_mamba_transfer_offsets(
+                                layer_name,
+                                local_mamba,
+                                remote_mamba,
+                                remote_tp_size=remote_tp_size,
+                            )
                         )
-                    )
+                    else:
+                        local, remote, sizes, n_conv = (
+                            self._compute_mamba_slice_read_offsets(
+                                layer_name, local_mamba, remote_mamba, metadata, source
+                            )
+                        )
+                    for index, portion in (
+                        (region_sessions[0], slice(0, n_conv)),
+                        (region_sessions[1], slice(n_conv, None)),
+                    ):
+                        if sizes[portion]:
+                            plans.append(
+                                (
+                                    layer_name,
+                                    sessions[index],
+                                    local[portion],
+                                    remote[portion],
+                                    sizes[portion],
+                                )
+                            )
             else:
                 group_idx = (
                     self._hybrid_payload_index_by_layer
@@ -4345,54 +4407,90 @@ class MoRIIOConnectorWorker:
                 )[layer_name]
                 local_layer_blocks = local_block_ids[group_idx]
                 remote_layer_blocks = remote_block_ids[group_idx]
-                layer_sources = self._read_plan(
-                    int(remote_tp_size), chosen_tp, layer_name
-                )[0]
-                for source, sessions, remote_moriio_meta, remote_dp_engine_id in reads(
-                    layer_sources
-                ):
+                layer_sources = self._read_plan(remote_tp_size, chosen_tp, layer_name)[
+                    0
+                ]
+                for source, sessions, metadata, engine_id in reads(layer_sources):
                     if source is not None and source.target.num_heads == 0:
-                        # Another prefill rank holds the same heads and is read.
                         continue
-                    offs = self._compute_read_attention_offsets(
+                    if fenced and not self._is_mla_cache_layer(layer_name):
+                        self._validate_read_head_layout(
+                            layer_name, metadata, remote_tp_size
+                        )
+                    local, remote, sizes = self._compute_read_attention_offsets(
                         layer_name,
                         local_layer_blocks,
                         remote_layer_blocks,
-                        remote_moriio_meta,
-                        int(remote_tp_size),
-                        remote_dp_engine_id,
+                        metadata,
+                        remote_tp_size,
+                        engine_id,
                         source,
                     )
-                    statuses.append(
-                        self._post_read_with_backoff(
-                            sessions[region_sessions[0]],
-                            offs[2],
-                            offs[0],
-                            offs[1],
-                            request_id,
-                            layer_name,
-                            _sq_deadline,
+                    if sizes:
+                        plans.append(
+                            (
+                                layer_name,
+                                sessions[region_sessions[0]],
+                                local,
+                                remote,
+                                sizes,
+                            )
                         )
-                    )
+
+        with self.moriio_wrapper.lock:
+            if fenced:
+                # Unsealed until every native post has returned its own status.
+                self._sharded_read_requests.add(request_id)
+                self._uncertain_read_posts.add(request_id)
+            self._recving_transfers[request_id] = {}
+            self._recving_transfers_start[request_id] = time.monotonic()
+            self._recving_local_blocks[request_id] = (
+                list(local_attn)
+                if self._has_mamba
+                else [block for group in local_block_ids for block in group]
+            )
+            self._recving_transfers_callback_addr[request_id] = (
+                remote_host,
+                notify_ports,
+                transfer_id,
+            )
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        for layer_name, session, local, remote, sizes in plans:
+            # If this raises, native posting may already have happened. Keep
+            # the unsealed request and all earlier handles: no cancellation ABI
+            # exists here, so a Python timeout cannot authorize source release.
+            status = self._post_read_with_backoff(
+                session, sizes, local, remote, request_id, layer_name, deadline
+            )
             with self.moriio_wrapper.lock:
-                self._recving_transfers[request_id][layer_name] = statuses
-                self._recving_transfers_start.setdefault(request_id, time.monotonic())
-                # Destination blocks, kept for _record_failed_recv.
-                if self._has_mamba:
-                    failed_recv_blocks = local_attn
-                else:
-                    failed_recv_blocks = [
-                        block_id for group in local_block_ids for block_id in group
-                    ]
-                self._recving_local_blocks.setdefault(
-                    request_id, list(failed_recv_blocks)
+                self._recving_transfers[request_id].setdefault(layer_name, []).append(
+                    status
                 )
-                self._reads_issued_this_step.extend(statuses)
-                self._recving_transfers_callback_addr[request_id] = (
-                    remote_host,
-                    notify_ports,
-                    transfer_id,
-                )
+                self._reads_issued_this_step.append(status)
+        if fenced:
+            self._uncertain_read_posts.remove(request_id)
+
+    def _validate_read_head_layout(
+        self, layer_name: str, metadata: MoRIIOAgentMetadata, remote_tp_size: int
+    ) -> None:
+        local = self.kv_head_layouts.get(layer_name)
+        wire = metadata.kv_head_layouts.get(layer_name)
+        if local is None or wire is None:
+            raise MoRIIOError("Heterogeneous-TP READ needs both peers' KV head layouts")
+        peer = HeadLayout.from_wire(wire)
+        heads = self._layer_total_num_kv_heads(layer_name)
+        if (local.num_heads, peer.num_heads) != (
+            max(1, heads // self.world_size),
+            max(1, heads // remote_tp_size),
+        ):
+            raise MoRIIOError("Sliced READ peer KV head counts disagree with TP")
+        for layout in (local, peer):
+            if (
+                any(value <= 0 for value in layout[:6])
+                or not layout.plane_offsets
+                or any(value < 0 for value in layout.plane_offsets)
+            ):
+                raise MoRIIOError("Invalid sliced READ head layout")
 
     def _send_read_release(
         self, transfer_id: str, host: str, ports: tuple[str, ...]

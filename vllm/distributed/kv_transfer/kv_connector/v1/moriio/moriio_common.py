@@ -152,6 +152,8 @@ class MoRIIOAgentMetadata(
     # Layer name -> index of its first region in kv_caches_base_addr. Peers can
     # register different layers (a pipeline stage holds a slice of them).
     layer_base_addr_index: dict[str, int] = {}
+    # Only an explicitly configured READ producer promises ACK-fenced ownership.
+    read_ack_fenced_hold: bool = False
 
 
 class RoleManager:
@@ -272,6 +274,22 @@ def pod_index(global_dp_rank: int, dp_size_local: int) -> int:
     return global_dp_rank // dp_size_local if dp_size_local else 0
 
 
+def get_moriio_read_ack_fenced_hold(kv_transfer_config: KVTransferConfig) -> bool:
+    """Whether this READ producer enforces ACK-fenced source block ownership."""
+    value = kv_transfer_config.kv_connector_extra_config.get(
+        "read_ack_fenced_hold", False
+    )
+    if type(value) is not bool:
+        raise ValueError(
+            "kv_connector_extra_config.read_ack_fenced_hold must be a bool"
+        )
+    return (
+        value
+        and kv_transfer_config.kv_role == "kv_producer"
+        and get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ
+    )
+
+
 def resolve_host_ip(extra_config: dict) -> str:
     """The IP this MoRIIO process advertises for KV transfer.
 
@@ -327,6 +345,7 @@ class MoRIIOConfig:
     pp_port_stride: int = 0
     port_offset: int = 0
     read_mode: bool = False
+    read_ack_fenced_hold: bool = False
     qp_per_transfer: int = 1
     post_batch_size: int = -1
     num_workers: int = 1
@@ -378,6 +397,7 @@ class MoRIIOConfig:
         _warn_deprecated_env_vars()
         kv_transfer_config = vllm_config.kv_transfer_config
         extra_config = kv_transfer_config.kv_connector_extra_config
+        read_ack_fenced_hold = get_moriio_read_ack_fenced_hold(kv_transfer_config)
         tp_rank = get_tensor_model_parallel_rank()
         # Fold the global data_parallel_rank back to [0, dp_size_local) for
         # per-node port allocation (handles the external-DP sentinel).
@@ -450,6 +470,7 @@ class MoRIIOConfig:
             pp_port_stride=pp_port_stride,
             port_offset=port_offset,
             read_mode=get_moriio_mode(kv_transfer_config) == MoRIIOMode.READ,
+            read_ack_fenced_hold=read_ack_fenced_hold,
             qp_per_transfer=int(extra_config.get("qp_per_transfer", 1)),
             post_batch_size=int(extra_config.get("post_batch_size", -1)),
             num_workers=int(extra_config.get("num_workers", 1)),

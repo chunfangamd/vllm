@@ -50,7 +50,9 @@ from .test_moriio_hetero_tp_write import (
     _expected,
     _global_state,
     _groups,
+    _real_rank_workers,  # noqa: F401
 )
+from .test_moriio_read_lifetime import transport as _transport_service  # noqa: F401
 
 pytestmark = pytest.mark.cpu_test
 
@@ -90,7 +92,8 @@ def _metadata(rank: Rank) -> MoRIIOAgentMetadata:
     metadata = MoRIIOAgentMetadata(
         engine_id="prefill",
         agent_metadata=b"",
-        kv_caches_base_addr=[],
+        kv_caches_base_addr=worker.kv_caches_base_addr[worker.engine_id],
+        layer_base_addr_index=worker.layer_base_addr_index,
         num_blocks=NUM_BLOCKS,
         block_len=0,
         attn_backend_name="test",
@@ -102,6 +105,7 @@ def _metadata(rank: Rank) -> MoRIIOAgentMetadata:
             for name, layout in worker.mamba_state_layouts.items()
         },
         attention_block_sizes=worker.attention_block_sizes,
+        read_ack_fenced_hold=worker.moriio_config.read_ack_fenced_hold,
     )
     # The handshake carries the metadata as msgpack.
     return msgspec.msgpack.decode(
@@ -164,14 +168,9 @@ def _make_reader(
         backend=backend, transfer_timeout=30.0, recv_abort_timeout=600.0
     )
     worker._get_built_session = get_built_session
-    worker.moriio_wrapper = SimpleNamespace(
-        lock=threading.Lock(),
-        read_remote_data=read_remote_data,
-        send_notify=send_notify,
-        poll_transfer_batch=lambda statuses: MoRIIOWrapper.poll_transfer_batch(
-            None, statuses
-        ),
-    )
+    worker.moriio_wrapper = MoRIIOWrapper()
+    worker.moriio_wrapper.read_remote_data = read_remote_data
+    worker.moriio_wrapper.send_notify = send_notify
     worker._recving_transfers = defaultdict(dict)
     worker._recving_transfers_start = {}
     worker._recving_transfers_callback_addr = {}
@@ -499,6 +498,9 @@ def test_background_handshake_dials_every_read_source():
     submitted = []
 
     class Executor:
+        def shutdown(self, **kwargs):
+            pass
+
         def submit(self, fn, *args):
             submitted.append(args)
             return SimpleNamespace(
