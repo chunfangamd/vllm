@@ -5748,6 +5748,30 @@ steps:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - pytest -v -s -rs v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py -k heterogeneous_tp
 
+- label: ":amd: (MI355) MoRIIO READ P/D Dummy-Weight Heterogeneous TP over RDMA"
+  timeout_in_minutes: 45
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_4
+  num_gpus: 4
+  parallelism: 2
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/distributed/kv_transfer/kv_connector/v1/moriio/
+  - vllm/distributed/kv_transfer/kv_connector/v1/base.py
+  - vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py
+  - vllm/model_executor/model_loader/dummy_loader.py
+  - examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py
+  - tests/v1/kv_connector/moriio_integration/
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - export MORIIO_DUMMY_E2E_BACKEND=rdma
+  # Fail loudly instead of timing out in the handshake without RDMA devices.
+  - ls /dev/infiniband
+  - pytest -v -s -rs v1/kv_connector/moriio_integration/test_write_dummy_e2e_rocm.py -k "heterogeneous_tp and READ" --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+
 - label: ":amd: (MI355 DPX) V1 Metrics + LM Eval"
   timeout_in_minutes: 65
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
